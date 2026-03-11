@@ -23,7 +23,37 @@ pub struct H5iRepository {
 // ============================================================
 
 impl H5iRepository {
-    /// 既存のGitリポジトリからh5iコンテキストを初期化/開く
+    /// Opens or initializes an `h5i` context for an existing Git repository.
+    ///
+    /// This function discovers the Git repository starting from the given path
+    /// and ensures that the `.h5i` metadata directory exists inside the
+    /// repository root.
+    ///
+    /// If the `.h5i` directory does not exist, it will be created along with
+    /// several subdirectories used by the system:
+    ///
+    /// - `ast/` – stores hashed AST representations for tracked files
+    /// - `metadata/` – stores commit-related metadata (e.g., AI provenance)
+    /// - `crdt/` – stores CRDT state or collaboration data
+    ///
+    /// # Parameters
+    ///
+    /// - `path`: A path inside the target Git repository (or the repository root).
+    ///
+    /// # Returns
+    ///
+    /// Returns a [`H5iRepository`] instance containing:
+    ///
+    /// - the discovered Git repository handle
+    /// - the `.h5i` root directory path
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - a Git repository cannot be discovered from the given path
+    /// - the repository root directory cannot be determined
+    /// - the `.h5i` directories cannot be created
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, H5iError> {
         let git_repo = Repository::discover(path)?;
         let h5i_root = git_repo
@@ -52,7 +82,58 @@ impl H5iRepository {
 // ============================================================
 
 impl H5iRepository {
-    /// Gitコミットを実行し、h5i拡張データをアトミックに紐付ける
+    /// Creates a Git commit and atomically associates it with h5i extended metadata.
+    ///
+    /// This function performs a standard Git commit while collecting and storing
+    /// additional `h5i` sidecar data. The extra metadata may include:
+    ///
+    /// - **AI provenance metadata** describing AI-assisted code generation
+    /// - **AST hashes** derived from source files using an optional parser
+    /// - **Test provenance metrics** extracted from staged test files
+    ///
+    /// The collected metadata is stored separately in the `.h5i` directory
+    /// and linked to the Git commit via the commit OID.
+    ///
+    /// The operation proceeds in three phases:
+    ///
+    /// 1. **Pre-processing staged files**
+    ///    - Optionally generate AST representations using the provided parser.
+    ///    - Optionally extract test-related metrics.
+    ///
+    /// 2. **Git commit creation**
+    ///    - Uses the `git2` API to write the index tree and create a commit.
+    ///
+    /// 3. **Sidecar metadata persistence**
+    ///    - A corresponding `H5iCommitRecord` is created and stored under `.h5i`.
+    ///
+    /// # Parameters
+    ///
+    /// - `message` – Commit message.
+    /// - `author` – Git author signature.
+    /// - `committer` – Git committer signature.
+    /// - `ai_meta` – Optional AI provenance metadata associated with the commit.
+    /// - `enable_test_tracking` – Enables automatic test provenance detection.
+    /// - `ast_parser` – Optional externally injected parser that converts a file
+    ///   into an AST S-expression representation.
+    ///
+    /// # Returns
+    ///
+    /// Returns the [`Oid`] of the newly created Git commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - the Git index cannot be accessed or written
+    /// - the commit cannot be created
+    /// - AST sidecar data cannot be persisted
+    /// - the `h5i` metadata record cannot be stored
+    ///
+    /// # Notes
+    ///
+    /// The AST parser is injected as a function pointer to keep the repository
+    /// layer language-agnostic. This allows external tools to supply parsers
+    /// for different programming languages without modifying the core system.
     pub fn commit(
         &self,
         message: &str,
@@ -60,21 +141,21 @@ impl H5iRepository {
         committer: &Signature,
         ai_meta: Option<AiMetadata>,
         enable_test_tracking: bool,
-        ast_parser: Option<&dyn Fn(&Path) -> Option<String>>, // 外部注入のオプショナルパーサー
+        ast_parser: Option<&dyn Fn(&Path) -> Option<String>>, // Optional externally injected parser
     ) -> Result<Oid, H5iError> {
         let mut index = self.git_repo.index()?;
 
-        // 1. オプショナル機能の実行準備
+        // 1. Prepare optional features
         let mut ast_hashes = None;
         let mut test_metrics = None;
 
-        // ステージングされたファイルを走査
+        // Scan staged files
         for entry in index.iter() {
             let path_bytes = &entry.path;
             let path_str = std::str::from_utf8(path_bytes).unwrap();
             let full_path = self.git_repo.workdir().unwrap().join(path_str);
 
-            // A. AST生成 (オプショナル)
+            // A. AST generation (optional)
             if let Some(parser) = ast_parser {
                 let hashes = ast_hashes.get_or_insert_with(HashMap::new);
                 if let Some(sexp) = parser(&full_path) {
@@ -83,13 +164,13 @@ impl H5iRepository {
                 }
             }
 
-            // B. テストプロビナンスの取得 (オプショナル)
+            // B. Extract test provenance (optional)
             if enable_test_tracking && test_metrics.is_none() {
                 test_metrics = self.scan_test_block(&full_path);
             }
         }
 
-        // 2. 標準 Git コミットの作成 (git2-rs API を利用)
+        // 2. Create the standard Git commit (using the git2-rs API)
         let tree_id = index.write_tree()?;
         let tree = self.git_repo.find_tree(tree_id)?;
         let parent_commit = self.get_head_commit().ok();
@@ -102,7 +183,7 @@ impl H5iRepository {
             self.git_repo
                 .commit(Some("HEAD"), author, committer, message, &tree, &parents)?;
 
-        // 3. h5i サイドカーレコードの保存
+        // 3. Persist the h5i sidecar record
         let record = H5iCommitRecord {
             git_oid: commit_oid.to_string(),
             parent_oid: parent_commit.map(|p| p.id().to_string()),
@@ -123,7 +204,29 @@ impl H5iRepository {
 // ============================================================
 
 impl H5iRepository {
-    /// AI情報を含む拡張コミットログを取得する
+    /// Retrieves an extended commit log that includes AI provenance metadata.
+    ///
+    /// This function traverses the Git commit history starting from `HEAD`
+    /// and attempts to load the corresponding `h5i` sidecar metadata for
+    /// each commit.
+    ///
+    /// If a sidecar metadata file does not exist for a given commit,
+    /// the function falls back to constructing a minimal record using
+    /// only the information available in the Git commit object.
+    ///
+    /// # Parameters
+    ///
+    /// - `limit` – Maximum number of commits to return.
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of [`H5iCommitRecord`] entries representing the
+    /// most recent commits, enriched with `h5i` metadata when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Git revision walker cannot be created
+    /// or if the repository history cannot be traversed.
     pub fn get_log(&self, limit: usize) -> Result<Vec<H5iCommitRecord>, H5iError> {
         let mut revwalk = self.git_repo.revwalk()?;
         revwalk.push_head()?;
@@ -131,7 +234,8 @@ impl H5iRepository {
         let mut records = Vec::new();
         for oid in revwalk.take(limit) {
             let oid = oid?;
-            // .h5i/metadata/<oid>.json を読み取る。存在しない場合は最小限のGit情報を返す
+            // Read `.h5i/metadata/<oid>.json`. If it does not exist,
+            // return a minimal record derived from Git.
             let record = self
                 .load_h5i_record(oid)
                 .unwrap_or_else(|_| H5iCommitRecord::minimal_from_git(&self.git_repo, oid));
@@ -140,15 +244,39 @@ impl H5iRepository {
         Ok(records)
     }
 
-    /// AI メタデータを含む拡張ログの取得
+    /// Retrieves the extended `h5i` commit log including AI metadata.
+    ///
+    /// This method behaves similarly to `get_log`, but is intended as the
+    /// primary API for accessing commit history enriched with `h5i`
+    /// provenance data such as:
+    ///
+    /// - AI generation metadata
+    /// - test provenance metrics
+    /// - AST hash tracking
+    ///
+    /// The history traversal begins at `HEAD` and proceeds backwards.
+    ///
+    /// # Parameters
+    ///
+    /// - `limit` – Maximum number of commits to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of [`H5iCommitRecord`] values representing the
+    /// extended commit history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Git revision walker fails to initialize
+    /// or if history traversal encounters an issue.
     pub fn h5i_log(&self, limit: usize) -> Result<Vec<H5iCommitRecord>, H5iError> {
         let mut revwalk = self.git_repo.revwalk()?;
-        revwalk.push_head()?; // HEAD から遡る
+        revwalk.push_head()?; // Traverse history starting from HEAD
 
         let mut logs = Vec::new();
         for oid in revwalk.take(limit) {
             let oid = oid?;
-            // サイドカーデータを読み取る。なければ Git 情報から最小構成を作成
+            // Load sidecar metadata. If unavailable, construct a minimal record from Git data.
             let record = self
                 .load_h5i_record(oid)
                 .unwrap_or_else(|_| H5iCommitRecord::minimal_from_git(&self.git_repo, oid));
@@ -157,6 +285,31 @@ impl H5iRepository {
         Ok(logs)
     }
 
+    /// Prints a human-readable commit log enriched with `h5i` metadata.
+    ///
+    /// This function traverses the Git history starting from `HEAD` and
+    /// prints commit information similar to `git log`, augmented with
+    /// additional `h5i` metadata when available.
+    ///
+    /// The output may include:
+    ///
+    /// - Commit identifier and author
+    /// - AI agent metadata (agent ID, model name, prompt hash)
+    /// - Test provenance metrics (test suite hash and coverage)
+    /// - Number of tracked AST hashes
+    /// - Commit message
+    ///
+    /// Missing metadata is handled gracefully; commits without sidecar
+    /// records are displayed using only the standard Git information.
+    ///
+    /// # Parameters
+    ///
+    /// - `limit` – Maximum number of commits to display.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the repository history cannot be traversed
+    /// or if commit objects cannot be retrieved.
     pub fn print_log(&self, limit: usize) -> anyhow::Result<()> {
         let mut revwalk = self.git_repo.revwalk()?;
         revwalk.push_head()?;
@@ -164,7 +317,7 @@ impl H5iRepository {
         for oid in revwalk.take(limit) {
             let oid = oid?;
             let commit = self.git_repo.find_commit(oid)?;
-            let record = self.load_h5i_record(oid).ok(); // オプショナルに読み込み
+            let record = self.load_h5i_record(oid).ok();
 
             println!("commit {}", oid);
             println!("Author: {}", commit.author());
@@ -194,122 +347,102 @@ impl H5iRepository {
 // ============================================================
 
 impl H5iRepository {
+    /// Computes blame information for a file using the specified mode.
+    ///
+    /// This function acts as a dispatcher that selects the appropriate
+    /// blame algorithm based on the provided [`BlameMode`].
+    ///
+    /// # Modes
+    ///
+    /// - `BlameMode::Line` – Standard line-based blame using Git history.
+    /// - `BlameMode::Ast` – Semantic blame based on AST structure changes.
+    ///
+    /// # Parameters
+    ///
+    /// - `path` – Path to the target file within the repository.
+    /// - `mode` – The blame computation strategy.
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of [`BlameResult`] entries describing the origin
+    /// of each line (or semantic unit) in the file.
     pub fn blame(
         &self,
         path: &std::path::Path,
         mode: BlameMode,
-    ) -> anyhow::Result<Vec<BlameResult>> {
+    ) -> Result<Vec<BlameResult>, H5iError> {
         match mode {
             BlameMode::Line => self.blame_by_line(path),
             BlameMode::Ast => self.blame_by_ast(path),
         }
     }
 
-    pub fn get_blame(
-        &self,
-        path: &Path,
-        use_ast: bool,
-    ) -> Result<Vec<crate::blame::BlameResult>, H5iError> {
-        if use_ast {
-            // 1. 最新のレコードから AST ハッシュ履歴を取得
-            // 2. 構造が変わったコミットを特定
-            self.compute_semantic_blame(path)
-        } else {
-            // 標準の git2 blame を実行し、メタデータを Join する
-            self.compute_line_blame(path)
-        }
-    }
-
-    /// 行ベースの Blame (Git 標準 + AI メタデータ)
-    fn blame_by_line(&self, path: &std::path::Path) -> anyhow::Result<Vec<BlameResult>> {
+    /// Performs line-based blame (Git standard + AI metadata).
+    ///
+    /// This method uses the native Git blame algorithm and enriches
+    /// the results with `h5i` metadata, including AI provenance
+    /// information when available.
+    ///
+    /// Each line in the file is mapped to the commit that last
+    /// modified it.
+    fn blame_by_line(&self, path: &std::path::Path) -> Result<Vec<BlameResult>, H5iError> {
         let blame = self.git_repo.blame_file(path, None)?;
         let mut results = Vec::new();
 
-        // ファイル内容を読み込み
-        let blob = self.get_blob_at_head(path)?;
-        let lines: Vec<&str> = std::str::from_utf8(blob.content())?.lines().collect();
-
-        for hunk in blame.iter() {
-            let commit_id = hunk.final_commit_id();
-            let record = self.load_h5i_record(commit_id).ok();
-            let agent_info = record
-                .and_then(|r| r.ai_metadata)
-                .map(|a| format!("AI:{}", a.agent_id))
-                .unwrap_or_else(|| "Human".to_string());
-
-            for i in 0..hunk.lines_in_hunk() {
-                let line_idx = hunk.final_start_line() + i - 1;
-                results.push(BlameResult {
-                    line_content: lines[line_idx].to_string(),
-                    commit_id: commit_id.to_string(),
-                    agent_info: agent_info.clone(),
-                    is_semantic_change: false,
-                    line_number: todo!(),
-                    test_passed: todo!(),
-                });
-            }
-        }
-        Ok(results)
-    }
-
-    /// AST ベースの Blame (構造ハッシュの変化を追跡)
-    fn blame_by_ast(
-        &self,
-        path: &std::path::Path,
-    ) -> anyhow::Result<Vec<crate::blame::BlameResult>> {
-        // 1. 最新のレコードから対象ファイルの AST ハッシュを取得
-        // 2. 履歴を遡り、そのハッシュが「最後に変化した」コミットを特定
-        // 3. そのコミットの AI 情報を取得
-        // 注意: 外部ツールが提供した AST が不正確な場合は、Line ベースにフォールバック表示
-        println!("Note: Semantic tracking depends on externally provided AST hashes.");
-        self.blame_by_line(path) // プロトタイプでは Line ベースで結果を表示しつつ、AST情報を付与
-    }
-
-    /// 従来の行ベース (1D) の Blame を高度化して実行
-    pub fn compute_line_blame(&self, path: &Path) -> Result<Vec<BlameResult>, H5iError> {
-        let blame = self.git_repo.blame_file(path, None)?;
+        // Load the file content at HEAD
         let blob = self.get_blob_at_head(path)?;
         let content = std::str::from_utf8(blob.content())
             .map_err(|_| H5iError::Ast("File content is not valid UTF-8".to_string()))?;
         let lines: Vec<&str> = content.lines().collect();
 
-        let mut results = Vec::new();
-
         for hunk in blame.iter() {
             let commit_id = hunk.final_commit_id();
-            // サイドカーデータをロード（なければ Git から最小構成を作成）
             let record = self.load_h5i_record(commit_id)?;
-
             let agent_info = record
                 .ai_metadata
-                .map(|ai| format!("AI:{}", ai.model_name))
+                .map(|a| format!("AI:{}", a.agent_id))
                 .unwrap_or_else(|| "Human".to_string());
-
-            let test_passed = record.test_metrics.map(|tm| tm.coverage > 0.0); // 簡易判定
+            let test_passed = record.test_metrics.map(|tm| tm.coverage > 0.0);
 
             for i in 0..hunk.lines_in_hunk() {
                 let line_idx = hunk.final_start_line() + i - 1;
                 if line_idx < lines.len() {
                     results.push(BlameResult {
-                        line_number: line_idx + 1,
                         line_content: lines[line_idx].to_string(),
                         commit_id: commit_id.to_string(),
                         agent_info: agent_info.clone(),
-                        is_semantic_change: false, // Lineモードでは一律 false
+                        is_semantic_change: false,
+                        line_number: line_idx + 1,
                         test_passed,
                     });
                 }
             }
         }
-
         Ok(results)
     }
 
-    /// ASTハッシュの変化 (Structural Dimension) に基づく Blame
-    /// 行が移動していても、ロジックが本質的に変更された瞬間を追跡する
-    pub fn compute_semantic_blame(&self, path: &Path) -> Result<Vec<BlameResult>, H5iError> {
-        // 基本的な行情報は Git Blame から取得
-        let mut line_results = self.compute_line_blame(path)?;
+    /// Performs semantic blame based on AST hash changes (structural dimension).
+    ///
+    /// Unlike traditional blame, which tracks line modifications,
+    /// semantic blame identifies the commit where the logical structure
+    /// of the code last changed.
+    ///
+    /// This allows the system to detect meaningful code modifications
+    /// even when lines are moved or reformatted.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Compute standard line-based blame results.
+    /// 2. Retrieve AST hashes associated with each commit.
+    /// 3. Compare AST hashes with the parent commit.
+    /// 4. Mark the commit as a semantic change if the hash differs.
+    ///
+    /// # Returns
+    ///
+    /// Returns blame results annotated with the `is_semantic_change` flag.
+    pub fn blame_by_ast(&self, path: &Path) -> Result<Vec<BlameResult>, H5iError> {
+        // Base line information from Git blame
+        let mut line_results = self.blame_by_line(path)?;
         let path_str = path
             .to_str()
             .ok_or_else(|| H5iError::InvalidPath("Invalid path encoding".to_string()))?;
@@ -318,10 +451,10 @@ impl H5iRepository {
             let oid = git2::Oid::from_str(&result.commit_id)?;
             let record = self.load_h5i_record(oid)?;
 
-            // 1. このコミットに AST ハッシュが含まれているか確認
+            // 1. Check if this commit contains an AST hash
             if let Some(hashes) = record.ast_hashes {
                 if let Some(current_ast_hash) = hashes.get(path_str) {
-                    // 2. 親コミットの AST ハッシュと比較
+                    // 2. Compare with the parent commit's AST hash
                     if let Some(parent_oid_str) = record.parent_oid {
                         let parent_oid = git2::Oid::from_str(&parent_oid_str)?;
                         if let Ok(parent_record) = self.load_h5i_record(parent_oid) {
@@ -329,13 +462,13 @@ impl H5iRepository {
                                 .ast_hashes
                                 .and_then(|h| h.get(path_str).cloned());
 
-                            // 親とハッシュが異なる場合、このコミットは「セマンティックな変更」
+                            // If hashes differ, this commit represents a semantic change
                             if Some(current_ast_hash.clone()) != parent_ast_hash {
                                 result.is_semantic_change = true;
                             }
                         }
                     } else {
-                        // 親がいない（最初のコミット）で AST があれば、それはセマンティックな誕生
+                        // No parent (initial commit): the AST introduction is semantic
                         result.is_semantic_change = true;
                     }
                 }
@@ -351,32 +484,82 @@ impl H5iRepository {
 // ============================================================
 
 impl H5iRepository {
-    /// H5iCommitRecord を JSON 形式でサイドカーディレクトリに永続化する。
-    /// ファイル名は Git のコミットハッシュ (<oid>.json) となる。
+    /// Persists an [`H5iCommitRecord`] as JSON in the sidecar metadata directory.
+    ///
+    /// The metadata is stored under `.h5i/metadata/` using the Git commit
+    /// hash as the filename (`<oid>.json`). Each file contains the extended
+    /// metadata associated with a specific Git commit, including optional
+    /// AI provenance, test metrics, and AST hashes.
+    ///
+    /// The serialization uses a pretty-printed JSON format to improve
+    /// readability and debugging during development.
+    ///
+    /// # Parameters
+    ///
+    /// - `record` – The [`H5iCommitRecord`] to be persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - the metadata directory cannot be created
+    /// - the record cannot be serialized to JSON
+    /// - the metadata file cannot be written to disk
+    ///
+    /// # Storage layout
+    ///
+    /// ```text
+    /// .h5i/
+    ///   metadata/
+    ///     <commit_oid>.json
+    /// ```
     pub fn persist_h5i_record(&self, record: H5iCommitRecord) -> Result<(), H5iError> {
-        // 1. 保存先ディレクトリ (.h5i/metadata) のパスを確定
+        // 1. Determine the destination directory (.h5i/metadata)
         let metadata_dir = self.h5i_root.join("metadata");
 
-        // 2. ディレクトリが存在しない場合は作成
+        // 2. Create the directory if it does not exist
         if !metadata_dir.exists() {
             fs::create_dir_all(&metadata_dir).map_err(|e| H5iError::Io(e))?;
         }
 
-        // 3. ファイルパスの決定 (<git_oid>.json)
+        // 3. Construct the file path (<git_oid>.json)
         let file_path = metadata_dir.join(format!("{}.json", record.git_oid));
 
-        // 4. JSON へのシリアライズ
-        // 実戦での可読性とデバッグ性を考慮し、pretty-print 形式を採用
+        // 4. Serialize the record to JSON
+        // Pretty-print format is used for better readability and debugging
         let json_data = serde_json::to_string_pretty(&record)?;
 
-        // 5. ファイルの書き込み
-        // 書き込み失敗時は H5iError::io を通じて詳細なパス情報を付与
+        // 5. Write the file to disk
+        // Errors are wrapped with H5iError::Io to preserve context
         fs::write(&file_path, json_data).map_err(|e| H5iError::Io(e))?;
 
         Ok(())
     }
 
-    /// 指定された OID に紐づく h5i レコードを読み込む (log や blame で使用)
+    /// Loads the `h5i` metadata record associated with a specific commit OID.
+    ///
+    /// This method reads the corresponding JSON file stored in the
+    /// `.h5i/metadata` directory and deserializes it into an
+    /// [`H5iCommitRecord`].
+    ///
+    /// The function is primarily used by higher-level APIs such as
+    /// `log`, `blame`, and other history inspection tools.
+    ///
+    /// # Parameters
+    ///
+    /// - `oid` – The Git commit [`Oid`] whose metadata should be loaded.
+    ///
+    /// # Returns
+    ///
+    /// Returns the corresponding [`H5iCommitRecord`] if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - the metadata file does not exist
+    /// - the file cannot be read
+    /// - the JSON data cannot be deserialized
     pub fn load_h5i_record(&self, oid: git2::Oid) -> Result<H5iCommitRecord, H5iError> {
         let file_path = self.h5i_root.join("metadata").join(format!("{}.json", oid));
 
@@ -390,7 +573,24 @@ impl H5iRepository {
         Ok(record)
     }
 
-    /// コミットに紐づくメタデータを保存する
+    /// Saves commit provenance metadata associated with a Git commit.
+    ///
+    /// This method stores a [`CommitProvenance`] structure as a JSON file
+    /// under `.h5i/metadata/`. The filename corresponds to the commit OID
+    /// contained in the provenance record.
+    ///
+    /// Compared to [`persist_h5i_record`], this function focuses specifically
+    /// on provenance metadata and may be used by external tools that only
+    /// need to record commit provenance information.
+    ///
+    /// # Parameters
+    ///
+    /// - `provenance` – A [`CommitProvenance`] object containing metadata
+    ///   describing the origin and context of the commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata cannot be serialized or written.
     pub fn save_metadata(
         &self,
         provenance: crate::metadata::CommitProvenance,
@@ -410,7 +610,42 @@ impl H5iRepository {
 // ============================================================
 
 impl H5iRepository {
-    /// 二つのブランチ（またはコミット）間のCRDT操作を統合し、コンフリクトなしのテキストを生成する
+    /// Merges CRDT operations from two branches (or commits) and produces
+    /// a conflict-free text representation.
+    ///
+    /// Unlike traditional Git merges that operate on text diffs, this method
+    /// reconstructs the document state using CRDT updates and merges the
+    /// operations from both branches.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Identify the merge base between `our_oid` and `their_oid`.
+    /// 2. Reconstruct the base document state by replaying all CRDT updates
+    ///    up to the merge base.
+    /// 3. Apply updates from the `ours` branch.
+    /// 4. Apply updates from the `theirs` branch.
+    /// 5. Extract the resulting text from the merged CRDT state.
+    ///
+    /// Because CRDT operations are commutative and conflict-free,
+    /// the resulting document state does not require manual conflict resolution.
+    ///
+    /// # Parameters
+    ///
+    /// - `our_oid` – The commit OID representing the current branch.
+    /// - `their_oid` – The commit OID representing the incoming branch.
+    /// - `file_path` – Path of the file being merged.
+    ///
+    /// # Returns
+    ///
+    /// Returns the merged text content produced by the CRDT document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - the merge base cannot be determined
+    /// - CRDT updates cannot be loaded or applied
+    /// - the repository history cannot be traversed
     pub fn merge_h5i_logic(
         &self,
         our_oid: Oid,
@@ -419,16 +654,16 @@ impl H5iRepository {
     ) -> Result<String, H5iError> {
         let base_oid = self.git_repo.merge_base(our_oid, their_oid)?;
 
-        // 1. 共通祖先 (Base) の完全な状態を復元する
-        // (ここでは操作ログを最初からマージベースまで再生して Doc を作る)
+        // 1. Reconstruct the full state of the common ancestor (base)
+        // by replaying all updates from the beginning up to the merge base.
         let mut doc = yrs::Doc::new();
         let text_ref = doc.get_or_insert_text("code");
 
-        // 起点となるベースまでの全履歴を適用
+        // Apply the entire history up to the base commit
         self.apply_all_updates_up_to(base_oid, file_path, &mut doc)?;
 
-        // 2. OURS と THEIRS の差分（Update）を取得してマージ
-        // 状態を分岐させず、同じ Doc に対して両方のブランチの「差分のみ」を適用する
+        // 2. Retrieve and merge updates from OURS and THEIRS
+        // Apply only the incremental updates from each branch to the same document.
         self.apply_updates_between(base_oid, our_oid, file_path, &mut doc)?;
         self.apply_updates_between(base_oid, their_oid, file_path, &mut doc)?;
 
@@ -436,7 +671,25 @@ impl H5iRepository {
         Ok(text_ref.get_string(&txn))
     }
 
-    /// 特定の範囲のコミットに紐づくデルタログをすべて適用する補助関数
+    /// Applies all CRDT updates associated with commits between `base` and `tip`.
+    ///
+    /// This helper function traverses the commit history from `tip` down to
+    /// (but excluding) `base` and applies the CRDT updates stored for each
+    /// commit.
+    ///
+    /// The function assumes that each commit may have an associated CRDT
+    /// delta stored in the `.h5i` sidecar storage.
+    ///
+    /// # Parameters
+    ///
+    /// - `base` – The base commit where traversal should stop.
+    /// - `tip` – The commit representing the tip of the branch.
+    /// - `file_path` – Path of the file whose updates should be applied.
+    /// - `doc` – The CRDT document being reconstructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if update decoding or application fails.
     fn apply_updates_between(
         &self,
         base: Oid,
@@ -450,17 +703,33 @@ impl H5iRepository {
 
         for oid_res in revwalk {
             let oid = oid_res?;
-            // 【重要】そのコミット固有のデルタ（Update）をロードする
-            // 以前実装した「h5i commit」で、コミット時にこのUpdateをサイドカーに保存しておく設計が必要
+            // IMPORTANT:
+            // Load the commit-specific CRDT delta.
+            // The design assumes that the "h5i commit" process persists
+            // these updates as sidecar metadata.
             if let Ok(update_data) = self.load_specific_delta_for_commit(oid, file_path) {
                 let mut txn = doc.transact_mut();
-                txn.apply_update(yrs::Update::decode_v1(&update_data)?);
+                txn.apply_update(yrs::Update::decode_v1(&update_data)?)?;
             }
         }
         Ok(())
     }
 
-    /// 履歴の最初から指定した base_oid まで、すべての差分を順番に適用して Doc を構築する
+    /// Reconstructs the document state by applying all updates from the
+    /// beginning of history up to `base_oid`.
+    ///
+    /// This function walks the commit history in chronological order
+    /// and sequentially applies all CRDT updates associated with the file.
+    ///
+    /// If a commit does not have a CRDT sidecar delta (e.g., a regular
+    /// human-created Git commit), the function falls back to ingesting
+    /// the full file content at that commit.
+    ///
+    /// # Parameters
+    ///
+    /// - `base_oid` – The commit up to which updates should be applied.
+    /// - `file_path` – The file being reconstructed.
+    /// - `doc` – The CRDT document being updated.
     pub fn apply_all_updates_up_to(
         &self,
         base_oid: Oid,
@@ -468,30 +737,49 @@ impl H5iRepository {
         doc: &mut yrs::Doc,
     ) -> Result<(), H5iError> {
         let mut revwalk = self.git_repo.revwalk()?;
-        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?; // 古い順に歩く
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?; // Walk in chronological order
         revwalk.push(base_oid)?;
 
         for oid_res in revwalk {
             let oid = oid_res?;
             if let Ok(update_data) = self.load_specific_delta_for_commit(oid, file_path) {
                 let mut txn = doc.transact_mut();
-                txn.apply_update(yrs::Update::decode_v1(&update_data)?);
+                txn.apply_update(yrs::Update::decode_v1(&update_data)?)?;
             } else {
-                // サイドカーにデルタがない（通常の人間によるコミットなど）場合のフォールバック
-                // その時点のファイル内容を「まるごと挿入」として扱う
+                // Fallback for commits without CRDT sidecar data
+                // (e.g., normal Git commits created by humans).
+                // In this case, the entire file content is ingested
+                // as a full replacement.
                 self.fallback_ingest_content(oid, file_path, doc)?;
             }
         }
         Ok(())
     }
 
-    /// 特定のコミット時に保存された、そのファイル固有の Update バイナリをロードする
+    /// Loads the CRDT update binary associated with a specific commit and file.
+    ///
+    /// The implementation assumes the following storage layout:
+    ///
+    /// ```text
+    /// .h5i/
+    ///   deltas/
+    ///     <commit_oid>/
+    ///       <file_hash>.bin
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `oid` – Commit OID.
+    /// - `file_path` – File path used to derive the hash identifier.
+    ///
+    /// # Returns
+    ///
+    /// Returns the raw CRDT update bytes for the given commit and file.
     pub fn load_specific_delta_for_commit(
         &self,
         oid: Oid,
         file_path: &str,
     ) -> Result<Vec<u8>, H5iError> {
-        // .h5i/deltas/<oid>/<file_hash>.bin という構造を想定
         let file_hash = sha256_hash(file_path);
         let delta_path = self
             .h5i_root
@@ -509,7 +797,13 @@ impl H5iRepository {
         Ok(buffer)
     }
 
-    /// サイドカーがないコミットの場合、Git から内容を読み取って CRDT に「全置換」として注入する
+    /// Ingests file content from Git when CRDT sidecar data is unavailable.
+    ///
+    /// This fallback mechanism is used for commits that do not contain
+    /// CRDT deltas (e.g., regular Git commits).
+    ///
+    /// The current CRDT document content is cleared and replaced with
+    /// the file content retrieved from the specified commit.
     fn fallback_ingest_content(
         &self,
         oid: Oid,
@@ -520,14 +814,29 @@ impl H5iRepository {
         let text_ref = doc.get_or_insert_text("code");
         let mut txn = doc.transact_mut();
 
-        // 既存の内容を消して、新しい内容を書き込む
+        // Remove the existing content and insert the new content
         let len = text_ref.len(&txn);
         text_ref.remove_range(&mut txn, 0, len);
         text_ref.push(&mut txn, &content);
         Ok(())
     }
 
-    /// そのコミットで発生した差分（Update）を、OID付きのサイドカーとして永続化する
+    /// Persists a CRDT delta associated with a specific commit.
+    ///
+    /// Each delta represents the document update produced during
+    /// the commit and is stored in the `.h5i` sidecar directory.
+    ///
+    /// # Storage layout
+    ///
+    /// ```text
+    /// .h5i/deltas/<commit_oid>/<file_hash>.bin
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `oid` – Commit OID.
+    /// - `file_path` – File path used to derive the hash identifier.
+    /// - `update_data` – Binary CRDT update data.
     pub fn persist_delta_for_commit(
         &self,
         oid: Oid,
@@ -537,12 +846,12 @@ impl H5iRepository {
         let file_hash = sha256_hash(file_path);
         let delta_dir = self.h5i_root.join("deltas").join(oid.to_string());
 
-        // ディレクトリ作成
+        // Create directory if necessary
         std::fs::create_dir_all(&delta_dir).map_err(|e| H5iError::Io(e))?;
 
         let delta_path = delta_dir.join(format!("{}.bin", file_hash));
 
-        // 差分バイナリを書き込み
+        // Write the delta binary
         std::fs::write(&delta_path, update_data).map_err(|e| H5iError::Io(e))?;
 
         Ok(())
@@ -554,34 +863,73 @@ impl H5iRepository {
 // ============================================================
 
 impl H5iRepository {
+    /// Returns a reference to the underlying Git repository.
+    ///
+    /// This provides direct access to the `git2::Repository` instance
+    /// used internally by `H5iRepository`.
     pub fn git(&self) -> &Repository {
         &self.git_repo
     }
 
+    /// Returns the root directory of the `.h5i` sidecar storage.
+    ///
+    /// The `.h5i` directory contains auxiliary metadata used by H5i,
+    /// such as:
+    ///
+    /// - AST sidecar files
+    /// - CRDT deltas
+    /// - commit metadata
     pub fn h5i_path(&self) -> &Path {
         &self.h5i_root
     }
 
+    /// Resolves the current `HEAD` reference and returns the associated commit.
+    ///
+    /// This method resolves symbolic references and ensures that the
+    /// resulting object is a commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - `HEAD` cannot be resolved
+    /// - the resolved object is not a commit
     fn get_head_commit(&self) -> Result<Commit<'_>, git2::Error> {
         let obj = self.git_repo.head()?.resolve()?.peel(ObjectType::Commit)?;
         obj.into_commit()
             .map_err(|_| git2::Error::from_str("Not a commit"))
     }
 
-    /// HEAD コミットから指定されたパスの Blob (ファイルの実体) を取得する。
+    /// Retrieves the `Blob` (file object) for a given path from the `HEAD` commit.
+    ///
+    /// # Parameters
+    ///
+    /// - `path` – Path to the file within the repository.
+    ///
+    /// # Returns
+    ///
+    /// Returns the Git blob representing the file contents at `HEAD`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - the path does not exist in `HEAD`
+    /// - the path does not correspond to a file
+    /// - the blob cannot be retrieved from the repository
     pub fn get_blob_at_head(&self, path: &Path) -> Result<Blob<'_>, H5iError> {
-        // 1. HEAD リファレンスを取得し、コミットまで解決する
+        // 1. Resolve the HEAD reference to a commit
         let head_commit = self.get_head_commit()?;
 
-        // 2. コミットからツリー（ファイル構造のスナップショット）を取得
+        // 2. Retrieve the tree (snapshot of the file structure)
         let tree = head_commit.tree()?;
 
-        // 3. ツリー内から指定されたパスののエントリを探す
+        // 3. Locate the entry corresponding to the specified path
         let entry = tree
             .get_path(path)
             .map_err(|_| H5iError::RecordNotFound(format!("Path not found in HEAD: {:?}", path)))?;
 
-        // 4. エントリが Blob (ファイル) であることを確認
+        // 4. Ensure that the entry is a Blob (file)
         if entry.kind() != Some(ObjectType::Blob) {
             return Err(H5iError::Ast(format!(
                 "Path is not a file (blob): {:?}",
@@ -589,30 +937,47 @@ impl H5iRepository {
             )));
         }
 
-        // 5. OID を使用して実際の Blob オブジェクトを検索して返す
+        // 5. Retrieve the actual Blob object using its OID
         let blob = self.git_repo.find_blob(entry.id())?;
         Ok(blob)
     }
 
-    /// 指定された OID (コミット等) における特定のパスの Blob を取得する
-    pub fn get_blob_at_oid(&self, oid: Oid, path: &Path) -> Result<Blob, H5iError> {
-        // 1. OID からコミットオブジェクトを探す
+    /// Retrieves the `Blob` associated with a given path at a specific commit.
+    ///
+    /// # Parameters
+    ///
+    /// - `oid` – Commit OID.
+    /// - `path` – File path within the repository.
+    ///
+    /// # Returns
+    ///
+    /// Returns the Git blob representing the file contents at the specified commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - the commit cannot be found
+    /// - the path does not exist in the commit tree
+    /// - the blob object cannot be retrieved
+    pub fn get_blob_at_oid(&'_ self, oid: Oid, path: &Path) -> Result<Blob<'_>, H5iError> {
+        // 1. Locate the commit object from the OID
         let commit = self
             .git_repo
             .find_commit(oid)
             .map_err(|e| H5iError::Internal(format!("Commit not found {}: {}", oid, e)))?;
 
-        // 2. コミットに紐づくツリー（ディレクトリ構造）を取得
+        // 2. Retrieve the tree associated with the commit
         let tree = commit.tree().map_err(|e| {
             H5iError::Internal(format!("Failed to get tree for commit {}: {}", oid, e))
         })?;
 
-        // 3. ツリーの中から指定されたパスのエントリを探す
+        // 3. Find the entry corresponding to the specified path
         let entry = tree.get_path(path).map_err(|_| {
             H5iError::InvalidPath(format!("Path {:?} not found in commit {}", path, oid))
         })?;
 
-        // 4. エントリの ID から実際のデータ（Blob）を取得
+        // 4. Retrieve the Blob object from its ID
         let blob = self.git_repo.find_blob(entry.id()).map_err(|e| {
             H5iError::Internal(format!("Failed to find blob for path {:?}: {}", path, e))
         })?;
@@ -620,18 +985,34 @@ impl H5iRepository {
         Ok(blob)
     }
 
-    /// (便利関数) 指定された OID の内容を String として取得する
+    /// Convenience helper that retrieves file content at a specific commit
+    /// and returns it as a UTF-8 string.
+    ///
+    /// # Parameters
+    ///
+    /// - `oid` – Commit OID.
+    /// - `path` – File path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - the file cannot be retrieved
+    /// - the file content is not valid UTF-8
     pub fn get_content_at_oid(&self, oid: Oid, path: &Path) -> Result<String, H5iError> {
         let blob = self.get_blob_at_oid(oid, path)?;
-
-        // UTF-8 チェックを行いながら文字列に変換
         let content = std::str::from_utf8(blob.content())
             .map_err(|_| H5iError::Internal(format!("File at {:?} is not valid UTF-8", path)))?;
 
         Ok(content.to_string())
     }
 
-    /// // h5_i_test_start ～ // h5_i_test_end を抽出してハッシュ化
+    /// Extracts the code block between
+    /// `// h5_i_test_start` and `// h5_i_test_end` and computes its hash.
+    ///
+    /// This method is used to identify the logical content of a test suite.
+    /// The resulting hash can be stored in commit metadata to track
+    /// changes to tests independently of the main source code.
     fn scan_test_block(&self, path: &Path) -> Option<TestMetrics> {
         let content = std::fs::read_to_string(path).ok()?;
         let start = "// h5_i_test_start";
@@ -645,23 +1026,39 @@ impl H5iRepository {
 
             Some(TestMetrics {
                 test_suite_hash: format!("{:x}", hasher.finalize()),
-                coverage: 0.0, // ここには CI 等の外部結果を入れる想定
+                coverage: 0.0,
             })
         } else {
             None
         }
     }
 
-    /// 外部から提供された S式 (AST) をサイドカーに保存し、そのハッシュを返す。
-    /// AST はオプショナルな機能であるため、提供された場合のみこの処理が呼ばれる。
+    /// Stores an externally provided S-expression (AST) into the `.h5i` sidecar.
+    ///
+    /// The AST is stored using **content-addressed storage**.
+    /// If the same AST content already exists, it will share the same hash.
+    ///
+    /// # Storage Layout
+    ///
+    /// ```text
+    /// .h5i/ast/<hash>.sexp
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `_file_path` – Source file path (currently unused but reserved for future indexing).
+    /// - `sexp` – Serialized AST represented as an S-expression.
+    ///
+    /// # Returns
+    ///
+    /// Returns the content hash of the stored AST.
     pub fn save_ast_to_sidecar(&self, _file_path: &str, sexp: &str) -> Result<String, H5iError> {
-        // 1. S式のコンテンツハッシュを計算
-        // これにより、内容が同じであれば同じファイルとして扱われる（デデュープ）
+        // Compute the content hash of the S-expression
         let mut hasher = Sha256::new();
         hasher.update(sexp.as_bytes());
         let hash = format!("{:x}", hasher.finalize());
 
-        // 2. 保存先パスの決定 (.h5i/ast/<hash>.sexp)
+        // Determine the storage location (.h5i/ast/<hash>.sexp)
         let ast_dir = self.h5i_root.join("ast");
         if !ast_dir.exists() {
             fs::create_dir_all(&ast_dir).map_err(|e| H5iError::Io(e))?;
@@ -669,19 +1066,24 @@ impl H5iRepository {
 
         let target_path = ast_dir.join(format!("{}.sexp", hash));
 
-        // 3. ファイルの書き込み
-        // すでに存在する場合は、コンテンツアドレス指定のため書き込みをスキップしてもよいが、
-        // 確実性のために常に書き込むか、存在チェックを行う
+        // Write the AST only if it does not already exist
         if !target_path.exists() {
             fs::write(&target_path, sexp).map_err(|e| H5iError::Io(e))?;
         }
 
-        // 4. ハッシュを返す (これが H5iCommitRecord の ast_hashes に格納される)
         Ok(hash)
     }
 
-    /// // h5_i_test_start 間のコードを抽出してハッシュ化
-    fn scan_test_metrics(&self, path: &std::path::Path) -> Option<TestMetrics> {
+    /// Extracts test code between
+    /// `// h5_i_test_start` and `// h5_i_test_end`
+    /// and produces test-related metrics.
+    ///
+    /// The extracted code is hashed to detect logical changes in the
+    /// test suite across commits.
+    ///
+    /// In production usage, coverage and runtime metrics may be
+    /// integrated from external CI systems.
+    pub fn scan_test_metrics(&self, path: &std::path::Path) -> Option<TestMetrics> {
         let content = std::fs::read_to_string(path).ok()?;
         let start_tag = "// h5_i_test_start";
         let end_tag = "// h5_i_test_end";
@@ -692,11 +1094,9 @@ impl H5iRepository {
             hasher.update(test_code.trim());
             let hash = format!("{:x}", hasher.finalize());
 
-            // 実際の運用ではここで直近のテスト実行結果(coverage)をJSON等から取得する
             Some(TestMetrics {
                 test_suite_hash: hash,
-                coverage: 0.0, // 後で結合
-                               //runtime_ms: 0,
+                coverage: 0.0,
             })
         } else {
             None
@@ -712,9 +1112,6 @@ mod tests {
     use tempfile::tempdir;
     use yrs::{Doc, Text, Transact, Update};
 
-    // --- テスト用ヘルパー ---
-
-    /// テスト用の Git リポジトリを初期化し、H5iRepository を返す
     fn setup_test_repo(root: &std::path::Path) -> H5iRepository {
         let repo = Repository::init(root).unwrap();
         let h5i_root = root.join(".h5i");
@@ -727,7 +1124,6 @@ mod tests {
         }
     }
 
-    /// Git コミットを作成するヘルパー
     fn create_commit(
         repo: &Repository,
         message: &str,
@@ -738,7 +1134,6 @@ mod tests {
         let mut index = repo.index().unwrap();
         let path = std::path::Path::new(file_path);
 
-        // ファイルを物理的に書き込んでインデックスに追加
         fs::write(repo.workdir().unwrap().join(path), content).unwrap();
         index.add_path(path).unwrap();
         let tree_id = index.write_tree().unwrap();
@@ -749,18 +1144,14 @@ mod tests {
             .unwrap()
     }
 
-    // --- テストケース ---
-
     #[test]
     fn test_get_content_at_oid() {
         let dir = tempdir().unwrap();
         let h5i_repo = setup_test_repo(dir.path());
         let git_repo = &h5i_repo.git_repo;
 
-        // 1. コミットを作成
         let oid = create_commit(git_repo, "initial", "hello.txt", "hello world", &[]);
 
-        // 2. 取得検証
         let content = h5i_repo
             .get_content_at_oid(oid, std::path::Path::new("hello.txt"))
             .unwrap();
@@ -774,10 +1165,9 @@ mod tests {
         let git_repo = &h5i_repo.git_repo;
         let file_path = "main.py";
 
-        // --- 1. Base (共通祖先) ---
         let base_content = "def main():\n    pass";
         let base_oid = create_commit(git_repo, "base", file_path, base_content, &[]);
-        // ベース時点のデルタも保存（空の状態からの挿入として記録）
+
         let base_update = {
             let doc = Doc::new();
             let text = doc.get_or_insert_text("code");
@@ -787,16 +1177,16 @@ mod tests {
         };
         h5i_repo.persist_delta_for_commit(base_oid, file_path, &base_update)?;
 
-        // --- 2. OURS (自分側の変更) ---
+        // --- 2. OURS ---
         let (our_oid, our_update) = {
             let doc = Doc::new();
             let text = doc.get_or_insert_text("code");
-            // ベースを再現
+
             let mut txn = doc.transact_mut();
-            txn.apply_update(Update::decode_v1(&base_update)?);
-            // 変更を加える
+            txn.apply_update(Update::decode_v1(&base_update)?)?;
+
             text.insert(&mut txn, 0, "# OURS COMMENT\n");
-            let update = txn.encode_update_v1(); // ここでは「差分」ではなく「全状態」として一旦扱う（簡易化のため）
+            let update = txn.encode_update_v1();
 
             let base_commit = git_repo.find_commit(base_oid)?;
             let oid = create_commit(
@@ -810,14 +1200,14 @@ mod tests {
         };
         h5i_repo.persist_delta_for_commit(our_oid, file_path, &our_update)?;
 
-        // --- 3. THEIRS (相手側の変更) ---
+        // --- 3. THEIRS ---
         git_repo.set_head_detached(base_oid)?;
         let (their_oid, their_update) = {
             let doc = Doc::new();
             let text = doc.get_or_insert_text("code");
             let mut txn = doc.transact_mut();
-            txn.apply_update(Update::decode_v1(&base_update)?);
-            // 変更を加える
+            txn.apply_update(Update::decode_v1(&base_update)?)?;
+
             text.push(&mut txn, "\nprint('done')");
             let update = txn.encode_update_v1();
 
@@ -833,10 +1223,10 @@ mod tests {
         };
         h5i_repo.persist_delta_for_commit(their_oid, file_path, &their_update)?;
 
-        // --- 4. Merge 実行 ---
+        // --- 4. Merge ---
         let merged_text = h5i_repo.merge_h5i_logic(our_oid, their_oid, file_path)?;
 
-        // --- 5. 検証 ---
+        // --- 5. Verify ---
         println!("Final Merged Text:\n{}", merged_text);
         assert!(merged_text.contains("# OURS COMMENT"));
         assert!(merged_text.contains("print('done')"));
