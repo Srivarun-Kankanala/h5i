@@ -1,3 +1,4 @@
+use console::style;
 use git2::{Blob, Repository};
 use git2::{Commit, ObjectType, Oid, Signature};
 use sha2::{Digest, Sha256};
@@ -373,24 +374,72 @@ impl H5iRepository {
             let commit = self.git_repo.find_commit(oid)?;
             let record = self.load_h5i_record(oid).ok();
 
-            println!("commit {}", oid);
-            println!("Author: {}", commit.author());
+            println!(
+                "{} {}",
+                style("commit").yellow(),
+                style(oid).magenta().bold()
+            );
+            println!("{:<10} {}", style("Author:").dim(), commit.author());
 
             if let Some(r) = record {
                 if let Some(ai) = r.ai_metadata {
-                    println!("Agent:  {} (Model: {})", ai.agent_id, ai.model_name);
-                    println!("Prompt: [{}]", ai.prompt);
-                }
-                if let Some(tm) = r.test_metrics {
                     println!(
-                        "Tests:  Hash: {}, Coverage: {}%",
-                        tm.test_suite_hash, tm.coverage
+                        "{:<10} {} {} {}",
+                        style("Agent:").dim(),
+                        style(&ai.agent_id).cyan().bold(),
+                        style(format!("({})", ai.model_name)).dim(),
+                        if ai.usage.is_some() {
+                            style("󱐋").yellow()
+                        } else {
+                            style("")
+                        }
+                    );
+
+                    if !ai.prompt.is_empty() {
+                        println!(
+                            "{:<10} {}",
+                            style("Prompt:").dim(),
+                            style(format!("\"{}\"", ai.prompt)).italic()
+                        );
+                    }
+
+                    if let Some(usage) = ai.usage {
+                        println!(
+                            "{:<10} {} {} {}",
+                            style("Usage:").dim(),
+                            style(format!("+{} tokens", usage.total_tokens)).green(),
+                            style("|").dim(),
+                            style(format!("model: {}", usage.model)).dim()
+                        );
+                    }
+                }
+
+                if let Some(tm) = r.test_metrics {
+                    let color = if tm.coverage > 80.0 {
+                        console::Color::Green
+                    } else {
+                        console::Color::Yellow
+                    };
+                    println!(
+                        "{:<10} {} {}%",
+                        style("Tests:").dim(),
+                        style("✔").fg(color),
+                        style(format!("{:.1}", tm.coverage)).fg(color)
                     );
                 }
+
                 let ast_count = r.ast_hashes.map(|m| m.len()).unwrap_or(0);
-                println!("AST:    {} files tracked", ast_count);
+                if ast_count > 0 {
+                    println!(
+                        "{:<10} {} {} files",
+                        style("AST:").dim(),
+                        style("🧬").cyan(),
+                        ast_count
+                    );
+                }
             }
-            println!("Message: {}\n", commit.message().unwrap_or(""));
+            println!("\n    {}\n", style(commit.message().unwrap_or("")).bold());
+            println!("{}", style("─".repeat(60)).dim());
         }
         Ok(())
     }
@@ -542,58 +591,6 @@ impl H5iRepository {
 // ============================================================
 
 impl H5iRepository {
-    /// Persists an [`H5iCommitRecord`] as JSON in the sidecar metadata directory.
-    ///
-    /// The metadata is stored under `.h5i/metadata/` using the Git commit
-    /// hash as the filename (`<oid>.json`). Each file contains the extended
-    /// metadata associated with a specific Git commit, including optional
-    /// AI provenance, test metrics, and AST hashes.
-    ///
-    /// The serialization uses a pretty-printed JSON format to improve
-    /// readability and debugging during development.
-    ///
-    /// # Parameters
-    ///
-    /// - `record` – The [`H5iCommitRecord`] to be persisted.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    ///
-    /// - the metadata directory cannot be created
-    /// - the record cannot be serialized to JSON
-    /// - the metadata file cannot be written to disk
-    ///
-    /// # Storage layout
-    ///
-    /// ```text
-    /// .h5i/
-    ///   metadata/
-    ///     <commit_oid>.json
-    /// ```
-    pub fn persist_h5i_record(&self, record: H5iCommitRecord) -> Result<(), H5iError> {
-        // 1. Determine the destination directory (.h5i/metadata)
-        let metadata_dir = self.h5i_root.join("metadata");
-
-        // 2. Create the directory if it does not exist
-        if !metadata_dir.exists() {
-            fs::create_dir_all(&metadata_dir).map_err(|e| H5iError::Io(e))?;
-        }
-
-        // 3. Construct the file path (<git_oid>.json)
-        let file_path = metadata_dir.join(format!("{}.json", record.git_oid));
-
-        // 4. Serialize the record to JSON
-        // Pretty-print format is used for better readability and debugging
-        let json_data = serde_json::to_string_pretty(&record)?;
-
-        // 5. Write the file to disk
-        // Errors are wrapped with H5iError::Io to preserve context
-        fs::write(&file_path, json_data).map_err(|e| H5iError::Io(e))?;
-
-        Ok(())
-    }
-
     /// Loads the `h5i` metadata record associated with a specific commit OID.
     ///
     /// This method reads the corresponding JSON file stored in the
@@ -1597,7 +1594,6 @@ mod tests {
         let merged_text = h5i_repo.merge_h5i_logic(our_oid, their_oid, file_path)?;
 
         // --- 5. Verify ---
-        println!("Final Merged Text:\n{}", merged_text);
         assert!(merged_text.contains("# OURS COMMENT"));
         assert!(merged_text.contains("print('done')"));
         assert!(merged_text.contains("def main():"));
