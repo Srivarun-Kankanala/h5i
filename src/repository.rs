@@ -1822,6 +1822,19 @@ impl H5iRepository {
         Ok(self.git_repo.head()?.peel_to_commit()?.id())
     }
 
+    pub fn edit_commit_message(&self, oid: Oid, new_message: &str) -> Result<Oid, H5iError> {
+        let commit = self.git_repo.find_commit(oid)?;
+        commit.amend(
+            Some("HEAD"),
+            None,
+            None,
+            None,
+            Some(new_message),
+            None,
+        )?;
+        Ok(self.git_repo.head()?.peel_to_commit()?.id())
+    }
+
     /// Resolves the current `HEAD` reference and returns the associated commit.
     ///
     /// This method resolves symbolic references and ensures that the
