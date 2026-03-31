@@ -1822,6 +1822,8 @@ impl H5iRepository {
         Ok(self.git_repo.head()?.peel_to_commit()?.id())
     }
 
+    // Provides opportunity to edit the message of a previously made commit.
+    // Returns the OID of the newly edited commit.
     pub fn edit_commit_message(&self, oid: Oid, new_message: &str) -> Result<Oid, H5iError> {
         let workdir = self
             .git_repo
