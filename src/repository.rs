@@ -1842,6 +1842,22 @@ impl H5iRepository {
             .current_dir(workdir)
             .output()
             .map_err(H5iError::Io)?;
+        
+
+        let output = std::process::Command::new("git")
+            .args([...])
+            .current_dir(workdir)
+            .output()
+            .map_err(H5iError::Io)?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("filter-branch stdout: {stdout}");
+        eprintln!("filter-branch stderr: {stderr}");
+        eprintln!("filter-branch exit: {}", output.status);
+
+
+        if !output.status.success() {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
