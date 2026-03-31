@@ -3279,4 +3279,65 @@ mod integration_tests {
 
         Ok(())
     }
+
+    // Testcase to edit a commit that does not have dependent commits
+    #[test]
+    fn test_edit_commit_message() {
+        let dir = tempdir().unwrap();
+        let repo = setup_integration_context(dir.path());
+        let git_repo = repo.git();
+        let sig = Signature::now("h5i-test", "test@h5i.io").unwrap();
+
+        let file_path = dir.path().join("funct.rs");
+        fs::write(&file_path, "fn funct() {}").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_path(std::path::Path::new("funct.rs")).unwrap();
+        index.write().unwrap();
+
+        let oid = repo
+            .commit("original message", &sig, &sig, None, TestSource::None, None, vec![], vec![])
+            .expect("commit failed");
+
+        let new_oid = repo
+            .edit_commit_message(oid, "rewritten message")
+            .expect("edit_commit_message failed");
+
+        let updated_commit = git_repo.find_commit(new_oid).unwrap();
+        assert_eq!(updated_commit.message().unwrap().trim(), "rewritten message");
+    }
+
+    // Testcase to edit a commit that has dependent commits
+    #[test]
+    fn test_edit_commit_message_non_head() {
+        let dir = tempdir().unwrap();
+        let repo = setup_integration_context(dir.path());
+        let git_repo = repo.git();
+        let sig = Signature::now("h5i-test", "test@h5i.io").unwrap();
+
+        let file_path = dir.path().join("funct.rs");
+        fs::write(&file_path, "fn funct() {}").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_path(std::path::Path::new("funct.rs")).unwrap();
+        index.write().unwrap();
+
+        let first_oid = repo
+            .commit("original message", &sig, &sig, None, TestSource::None, None, vec![], vec![])
+            .expect("first commit failed");
+
+        fs::write(&file_path, "fn funct() {} fn funct2() {}").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_path(std::path::Path::new("funct.rs")).unwrap();
+        index.write().unwrap();
+
+        repo.commit("second commit", &sig, &sig, None, TestSource::None, None, vec![], vec![])
+            .expect("second commit failed");
+
+        let new_oid = repo
+            .edit_commit_message(first_oid, "rewritten first message")
+            .expect("edit_commit_message failed");
+
+        let updated_commit = git_repo.find_commit(new_oid).unwrap();
+        assert_eq!(updated_commit.message().unwrap().trim(), "rewritten first message");
+    }
+
 }
