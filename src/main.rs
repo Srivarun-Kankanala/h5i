@@ -1269,7 +1269,7 @@ fn main() -> anyhow::Result<()> {
                 style(&commit[..8.min(commit.len())]).magenta(),
             );
 
-            let new_oid = repo.edit_commit_message(oid, &edit)?;
+            let (new_oid, _oid_map) = repo.edit_commit_message(oid, &edit)?;
             println!(
                 "{} {} {}",
                 SUCCESS,

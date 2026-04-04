@@ -1898,8 +1898,14 @@ impl H5iRepository {
     }
 
     // Provides opportunity to edit the message of a previously made commit.
-    // Returns the OID of the newly edited commit.
-    pub fn edit_commit_message(&self, oid: Oid, new_message: &str) -> Result<Oid, H5iError> {
+    // Returns the OID of the newly edited commit and a map of all old → new OIDs
+    // for every commit that was rewritten (including descendants of the target).
+    // Callers that hold OIDs to downstream commits must remap them using this map.
+    pub fn edit_commit_message(
+        &self,
+        oid: Oid,
+        new_message: &str,
+    ) -> Result<(Oid, HashMap<git2::Oid, git2::Oid>), H5iError> {
         // ── Phase 1: BFS from HEAD to find the target ────────────────────
         // `path` is ordered [target, ..., HEAD].
 
@@ -2126,7 +2132,7 @@ impl H5iRepository {
             self.git_repo.set_head_detached(new_head_oid)?;
         }
 
-        Ok(new_target_oid)
+        Ok((new_target_oid, oid_map))
     }
 
     /// Resolves the current `HEAD` reference and returns the associated commit.
@@ -3576,7 +3582,7 @@ mod integration_tests {
             .commit("original message", &sig, &sig, None, TestSource::None, None, vec![], vec![])
             .expect("commit failed");
 
-        let new_oid = repo
+        let (new_oid, _oid_map) = repo
             .edit_commit_message(oid, "rewritten message")
             .expect("edit_commit_message failed");
 
@@ -3610,7 +3616,7 @@ mod integration_tests {
         repo.commit("second commit", &sig, &sig, None, TestSource::None, None, vec![], vec![])
             .expect("second commit failed");
 
-        let new_oid = repo
+        let (new_oid, _oid_map) = repo
             .edit_commit_message(first_oid, "rewritten first message")
             .expect("edit_commit_message failed");
 
@@ -3717,11 +3723,14 @@ mod integration_tests {
             vec![],
         )?;
 
-        // Rewrite first commit's message — its OID changes
-        let new_first_oid = repo.edit_commit_message(first_oid, "rewritten first commit")?;
+        // Rewrite first commit's message — its OID changes, and second's OID changes too
+        let (new_first_oid, oid_map) = repo.edit_commit_message(first_oid, "rewritten first commit")?;
+
+        // second_oid was also rewritten because its parent changed; get the new OID from the map
+        let new_second_oid_from_map = *oid_map.get(&second_oid).expect("second_oid must be in oid_map");
 
         // The second commit's caused_by should now reference the new OID
-        let second_record = repo.load_h5i_record(second_oid)?;
+        let second_record = repo.load_h5i_record(new_second_oid_from_map)?;
         assert!(
             second_record.caused_by.contains(&new_first_oid.to_string()),
             "second commit's caused_by should be updated to new first OID"
@@ -3731,11 +3740,11 @@ mod integration_tests {
             "second commit's caused_by should not contain old first OID"
         );
 
-        // The rewritten first commit's causes should still reference the second commit
+        // The rewritten first commit's causes should reference the new second commit OID
         let new_first_record = repo.load_h5i_record(new_first_oid)?;
         assert!(
-            new_first_record.causes.contains(&second_oid.to_string()),
-            "rewritten first commit's causes should still reference second commit"
+            new_first_record.causes.contains(&new_second_oid_from_map.to_string()),
+            "rewritten first commit's causes should reference the new second commit OID"
         );
 
         Ok(())
